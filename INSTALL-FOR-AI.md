@@ -4,7 +4,7 @@
 > 用户可能不懂 YAML、路径、命令。你来装，用户只负责"允许、重启、看结果"。
 >
 > 目标：把 `gewu` 装进当前 DSH profile，让**往轮的思考不再进入下一轮上下文**。
-> 装好的标志：启动日志出现 `[gewu] 已启用`，用几轮后出现 `[gewu] 已摘 N 条`。
+> 装好的标志：`~/.dsh/gewu/gewu.log` 里出现 `[gewu] 已挂载 session=...`，用几轮后出现 `[gewu] 已摘 N 条`。
 >
 > **红线：**
 > - 不删任何东西；不改 DSH 源码；不动会话日志、不动 `~/.dsh/sessions`。
@@ -131,23 +131,33 @@ Copy-Item $patch "$patch.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
 
 ### 4.1 启动日志
 
-应该出现：
+**不要看终端** —— 桌面版主进程的 console 不落盘。看文件：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\gewu\gewu.log" -Tail 20
+```
+
+应该出现两行：
 
 ```
-[gewu] 已启用：保留最近 3 条思考，单步最多摘 12 条
+[gewu] 启动：keepLast=3
+[gewu] 已挂载 session=session-xxxx keepLast=3
 ```
 
-没有这行 → 看第 6 节排查。
+只有第一行、没有第二行 → 说明还没走到 pre-step（正常，聊一句就会挂上）。
+出现 `[gewu] 挂载失败：...` → DSH 版本对不上，看第 6 节。
+
+如果文件根本不存在 → 看第 6 节排查。
 
 ### 4.2 跑几轮再看日志
 
-在一个**已经有十几轮的老会话**里正常聊两三轮，应该出现：
+在一个**已经有十几轮的老会话**里正常聊两三轮，`gewu.log` 里应该出现：
 
 ```
-[gewu] 已摘 5 条 / 3120 字 / 5 块（保留最近 3 条；本会话累计 27 条 / 41882 字）
+[gewu] 已摘 198 条 / 160955 字（保留最近 3 条）
 ```
 
-第一次会连着摘几步（清积压），之后就安静了。
+数字会在几轮之内涨上来，然后稳定在「当前水位」（不是累计值，重启不会翻倍）。
 
 ### 4.3 统计文件
 
@@ -155,7 +165,7 @@ Copy-Item $patch "$patch.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
 Get-Content "$env:USERPROFILE\.dsh\gewu\stats.json"
 ```
 
-里面有当前会话的 `stripped / blocks / chars / failed`。
+里面有每个会话的 `stripped / chars`（当前被摘掉多少，不是累计）。
 
 ### 4.4 行为验证
 
@@ -174,7 +184,7 @@ gewu 安装结果
 - 插件文件：<绝对路径>
 - profile：<绝对路径>
 - keepLast：3
-- 启动日志：看到了 / 没看到
+- gewu.log：已挂载 / 挂载失败 / 没有文件
 - 已摘统计：<stats.json 里的数字>
 - 异常：无 / <具体报错>
 ```
@@ -187,10 +197,12 @@ gewu 安装结果
 
 | 现象 | 原因 | 处理 |
 |:--|:--|:--|
-| 启动没有 `[gewu]` 那行 | 路径错 / profile 改错文件 / 没重启 | 核对 2.1 的文件是不是当前在用的；确认重启 |
+| `gewu.log` 不存在 | 路径错 / profile 改错文件 / 没重启 | 核对 2.1 的文件是不是当前在用的；确认重启 |
+| 日志里是 `[gewu] 挂载失败：deriveMessages=...` | DSH 版本对不上（内部方法名变了） | 如实汇报版本号；先 `enabled: false` |
+| 日志里只有「启动」没有「已挂载」 | 还没聊过天，pre-step 没触发 | 发一句话再看 |
 | DSH 起不来，YAML 报错 | 缩进或引号错 | 用备份还原，重做 2.3，注意 4/6 空格 |
 | `Cannot use import statement outside a module` | 插件目录缺 `package.json` 或没写 `"type":"module"` | 补上，再重启 |
-| 模型报 400 / invalid thinking / signature | 替换后签名被去掉，个别 provider 不接受 | 把 `enabled: false` 加上，重启，如实汇报 |
+| 模型报 400 / invalid thinking / signature | 个别 provider 不接受无签名历史 | 把 `enabled: false` 加上，重启，如实汇报 |
 | 长任务开始"忘了为什么这么做" | 摘得太狠 | `keepLast` 改 5，重启 |
 | QQ 或其他插件异常 | 极小概率事件，需定位 | 先 `enabled: false` 确认是否本插件导致，再汇报 |
 
