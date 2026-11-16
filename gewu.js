@@ -1,49 +1,86 @@
 /**
- * gewu —— 往轮的思考不进上下文
+ * 格物 / gewu —— 往轮的思考不进上下文
  *
  * 问题：DSH 把 reasoning 当成 assistant 消息的一个 block，而历史以 message 为单位。
- * 所以每一轮请求都会把过去所有轮的思考重新上传一遍。后果有三：
- *   1) 风格自我复制（"做。做。做。"这类单字步骤戳越滚越牢）
- *   2) 未校验的猜测被下一轮当成事实
- *   3) 20%~45% 的上下文被草稿占着（实测 6 个会话，中位数 20~27%）
+ * 每一轮请求都会把过去所有轮的思考重新上传：风格自我复制、旧猜测变成事实、20%~45% 的上下文被草稿占着。
  *
- * 做法：每步开始前，把「往轮」assistant 消息里的 reasoning 块摘掉，
- * 用 surfaceOp: replace 在 surface 层换一条不含草稿的副本。
- * 原文仍在会话日志里（可审计、可回放），只是模型看不到了。
+ * 做法：不碰会话记录，只改「读出来的视图」。
+ *   - 请求路径：包 session.deriveMessages()（buildRequest 取模型输入的唯一入口）
+ *   - 压缩路径：包 session.deriveEventMessage()（compaction 摘要读取消息的入口）
+ * 两条都只返回「去掉 reasoning 的副本」，原文仍在本机日志里，可审计、可回放。
+ *
+ * 为什么不用 surfaceOp 替换：
+ *   DSH 0.1.3+ 在 assertSourceEventReferences 里写了死锁：
+ *   带 sourceEventSeqs → "assistant/message ... cannot carry sourceEventSeqs"
+ *   不带 → "must include every shadowed surface node"
+ *   assistant 消息结构上不允许整条替换。
  *
  * 边界（写死，别改）：
  *   - 只删 type === 'reasoning'；text / tool-call 一个字节不动
- *   - 保留最近 keepLast 条（当前轮的工具循环要接得上）
- *   - 任何一条失败都不影响对话
- *   - 不碰 tool/result、不碰 user/developer/system 消息
+ *   - 保留最近 keepLast 条 assistant 消息的思考，当前轮接得上
+ *   - 任何异常都返回原结果，绝不影响对话
+ *   - 不写 session、不碰 surface、不改原文
  *
- * 为什么改 surface 而不是拦请求：
- *   llm/stream 的 options 是 deepFreeze 的，且 waterfall 的 next() 捕获的是原对象，
- *   改不动（2026-11-07、2026-11-16 两次实测）。模型输入是从 session.surface 派生的
- *   （dsh-agent-loop buildRequest → session.deriveMessages），所以改 surface 才有效。
+ * 已知局限：
+ *   - 依赖 DSH 内部方法名（deriveMessages / deriveEventMessage），升版可能失效；
+ *     失效时只在日志里报一行，不会影响对话
+ *   - token-meter 用的是模块级 deriveEventMessage，不经过这层补丁，
+ *     它算出来的上下文水位可能偏高（真实计费以 provider 回执为准）
  */
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
 
 export const name = 'gewu'
 
 const DEFAULTS = {
   enabled: true,
-  // 保留最近几条 assistant 消息的思考。当前轮的工具循环要靠它接上。
+  // 保留最近几条 assistant 消息的思考（当前轮的工具循环要接得上）
   keepLast: 3,
-  // 单步最多摘几条：清历史积压时分批做，不要把一步拖长
-  maxStripsPerStep: 12,
-  // 只统计、不替换
+  // 只统计、不改视图
   dryRun: false,
 }
 
 const STATE_DIR = process.env.GEWU_DIR || path.join(os.homedir(), '.dsh', 'gewu')
+const LOG_PATH = path.join(STATE_DIR, 'gewu.log')
 const STATS_PATH = path.join(STATE_DIR, 'stats.json')
 
-// ── 纯函数（单测直接调）─────────────────────────────────
+// session -> 状态（副本缓存、挂载标记、上次日志时间）
+const STATES = new WeakMap()
+
+// ── 日志与统计 ─────────────────────────────────────────
+
+function appendLog(line) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    fs.appendFileSync(LOG_PATH, new Date().toISOString() + ' ' + line + '\n')
+  } catch { /* 日志写不进去不影响对话 */ }
+}
+
+function loadStats() {
+  try {
+    const o = JSON.parse(fs.readFileSync(STATS_PATH, 'utf8'))
+    if (o && typeof o === 'object' && o.sessions) return o
+  } catch { /* 没有就是新的 */ }
+  return { version: 2, updatedAt: '', sessions: {} }
+}
+
+function saveStats(stats) {
+  try {
+    stats.updatedAt = new Date().toISOString()
+    const rows = Object.entries(stats.sessions)
+      .sort((a, b) => String(b[1].updatedAt || '').localeCompare(String(a[1].updatedAt || '')))
+      .slice(0, 40)
+    stats.sessions = Object.fromEntries(rows)
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    const tmp = STATS_PATH + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(stats, null, 2), 'utf8')
+    fs.renameSync(tmp, STATS_PATH)
+  } catch { /* 统计写不进去不影响对话 */ }
+}
+
+// ── 纯函数（单测直接调）────────────────────────────────
 
 /** 这条消息里有没有推理块 */
 export function hasReasoning(message) {
@@ -67,169 +104,195 @@ export function reasoningSize(message) {
 
 /**
  * 生成一条去掉推理块的副本。
- * 没有可摘的、或摘完变空消息，返回 null（空 assistant 消息会被投影成 null，宁可不动）。
- * replayState 一并去掉：块数变了，旧签名必然失配；留着只会触发静默降级。
+ * replayState 一并去掉：块数变了，旧签名必然失配，留着只会触发静默降级。
  */
-export function stripReasoning(message, newId) {
+export function stripMessage(message) {
   if (!message || !Array.isArray(message.content)) return null
+  if (message.role !== 'assistant') return null
   const kept = message.content.filter((b) => !(b && b.type === 'reasoning'))
   if (kept.length === 0 || kept.length === message.content.length) return null
   const source = { ...(message.source || {}) }
   delete source.replayState
-  return {
-    ...message,
-    id: newId || randomUUID(),
-    content: kept,
-    source,
-  }
+  return { ...message, content: kept, source }
 }
 
-/** 从 surface 节点里挑出 assistant 消息的 seq（保持顺序） */
-export function collectAssistantSeqs(nodes, eventAt) {
-  const out = []
-  for (const seq of nodes || []) {
-    let ev
-    try { ev = eventAt(seq) } catch { continue }
-    if (ev && String(ev.type) === 'assistant/message') out.push(seq)
-  }
-  return out
-}
-
-/** 选出该摘的 seq：去掉最近 keepLast 条，新的先摘（最近的样本影响最大） */
-export function pickTargets(assistantSeqs, keepLast) {
+/**
+ * 从一组消息里挑出「该摘」的：按出现顺序，保留最后 keepLast 条带思考的 assistant 消息。
+ * 返回 Set<message>，方便按对象身份过滤。
+ */
+export function pickStrippable(messages, keepLast) {
+  const list = Array.isArray(messages) ? messages : []
   const keep = Math.max(0, Number(keepLast) || 0)
-  if (assistantSeqs.length <= keep) return []
-  return assistantSeqs.slice(0, assistantSeqs.length - keep).reverse()
+  const withReasoning = list.filter((m) => hasReasoning(m))
+  if (withReasoning.length <= keep) return new Set()
+  return new Set(withReasoning.slice(0, withReasoning.length - keep))
 }
 
-// ── 统计 ──────────────────────────────────────────────
-
-function loadStats() {
-  try {
-    const raw = fs.readFileSync(STATS_PATH, 'utf8')
-    const o = JSON.parse(raw)
-    if (o && typeof o === 'object' && o.sessions) return o
-  } catch { /* 没有就是新的 */ }
-  return { version: 1, updatedAt: '', sessions: {} }
-}
-
-function saveStats(stats) {
-  try {
-    stats.updatedAt = new Date().toISOString()
-    const rows = Object.entries(stats.sessions)
-      .sort((a, b) => String(b[1].updatedAt || '').localeCompare(String(a[1].updatedAt || '')))
-      .slice(0, 40)
-    stats.sessions = Object.fromEntries(rows)
-    fs.mkdirSync(STATE_DIR, { recursive: true })
-    const tmp = STATS_PATH + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify(stats, null, 2), 'utf8')
-    fs.renameSync(tmp, STATS_PATH)
-  } catch { /* 统计写不进去不影响对话 */ }
-}
-
-function sessionIdOf(agent) {
-  try {
-    return String((agent && agent.session && agent.session.id) || 'unknown')
-  } catch {
-    return 'unknown'
-  }
-}
-
-// ── 主逻辑 ────────────────────────────────────────────
-
-function sweep(agent, cfg) {
-  const sess = agent && agent.session
-  if (!sess || !sess.surface || !Array.isArray(sess.surface.nodes)) return null
-  if (typeof sess.eventAt !== 'function' || typeof sess.append !== 'function') return null
-
-  const nodes = sess.surface.nodes.slice()
-  const all = collectAssistantSeqs(nodes, (seq) => sess.eventAt(seq))
-  const targets = pickTargets(all, cfg.keepLast)
-  if (targets.length === 0) return null
-
-  let stripped = 0
-  let failed = 0
-  let blocks = 0
-  let chars = 0
-
-  for (const seq of targets) {
-    if (stripped + failed >= cfg.maxStripsPerStep) break
+/** 从 surface 节点里挑出「该摘」的 assistant seq（按顺序，保留最后 keepLast 条） */
+export function pickStrippableSeqs(session, keepLast) {
+  const nodes = session && session.surface && Array.isArray(session.surface.nodes) ? session.surface.nodes : []
+  const seqs = []
+  for (const seq of nodes) {
     let ev
-    try { ev = sess.eventAt(seq) } catch { continue }
-    if (!ev || String(ev.type) !== 'assistant/message') continue
-    const msg = ev.data && ev.data.message
-    if (!hasReasoning(msg)) continue
+    try { ev = session.eventAt(seq) } catch { continue }
+    if (ev && String(ev.type) === 'assistant/message' && hasReasoning(ev.data && ev.data.message)) seqs.push(seq)
+  }
+  const keep = Math.max(0, Number(keepLast) || 0)
+  if (seqs.length <= keep) return new Set()
+  return new Set(seqs.slice(0, seqs.length - keep))
+}
 
-    const size = reasoningSize(msg)
-    if (cfg.dryRun) {
-      stripped++
-      blocks += size.blocks
-      chars += size.chars
-      continue
+// ── 会话挂载 ───────────────────────────────────────────
+
+function stateOf(session) {
+  let st = STATES.get(session)
+  if (!st) {
+    st = {
+      patched: false,
+      // 原消息对象 -> 去掉思考的副本（WeakMap 保证身份稳定、不泄漏）
+      copies: new WeakMap(),
+      // 派生消息对象 -> 副本
+      seqCopies: new WeakMap(),
+      // 该摘的 seq 集合 + 缓存键
+      seqSet: null,
+      seqKey: '',
+      lastLogAt: 0,
+      lastReport: null,
     }
+    STATES.set(session, st)
+  }
+  return st
+}
 
-    const replacement = stripReasoning(msg, randomUUID())
-    if (!replacement) continue
+function strippableSeqsOf(session, st, keepLast) {
+  const nodes = session && session.surface && Array.isArray(session.surface.nodes) ? session.surface.nodes : []
+  const key = nodes.length + ':' + String(session && session.surface && session.surface.contentGeneration)
+  if (st.seqKey === key && st.seqSet) return st.seqSet
+  st.seqKey = key
+  st.seqSet = pickStrippableSeqs(session, keepLast)
+  return st.seqSet
+}
 
-    try {
-      sess.append('assistant/message', { ...ev.data, message: replacement }, {
-        surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
-        sourceEventSeqs: [seq],
-      })
-      stripped++
-      blocks += size.blocks
-      chars += size.chars
-    } catch (e) {
-      failed++
-      if (failed === 1) {
-        console.warn('[gewu] 替换失败（跳过，不影响对话）：', String((e && e.message) || e).slice(0, 160))
+function copyFor(message, st) {
+  let copy = st.copies.get(message)
+  if (!copy) {
+    copy = stripMessage(message)
+    if (!copy) return message
+    st.copies.set(message, copy)
+  }
+  return copy
+}
+
+function report(session, st, stats, counts) {
+  st.lastReport = counts
+  const sid = String((session && session.id) || 'unknown')
+  const s = stats.sessions[sid] || (stats.sessions[sid] = { stripped: 0, chars: 0, updatedAt: '' })
+  s.stripped = counts.stripped
+  s.chars = counts.chars
+  s.updatedAt = new Date().toISOString()
+  saveStats(stats)
+
+  const now = Date.now()
+  if (now - st.lastLogAt < 5000) return
+  st.lastLogAt = now
+  appendLog('[gewu] ' + (counts.dryRun ? '可摘' : '已摘') + ' ' + counts.stripped + ' 条 / ' + counts.chars + ' 字（保留最近 ' + counts.keepLast + ' 条）')
+}
+
+/**
+ * 给一个 session 挂上两处只读投影。
+ * 失败只记日志，不抛。
+ */
+export function patchSession(session, cfg, stats) {
+  if (!session || typeof session !== 'object') return false
+  const st = stateOf(session)
+  if (st.patched) return true
+
+  const origDeriveMessages = session.deriveMessages
+  const origDeriveEvent = session.deriveEventMessage
+  if (typeof origDeriveMessages !== 'function' || typeof origDeriveEvent !== 'function') {
+    appendLog('[gewu] 挂载失败：deriveMessages=' + typeof origDeriveMessages + ' deriveEventMessage=' + typeof origDeriveEvent)
+    return false
+  }
+
+  try {
+    // 1) 请求路径：buildRequest 拿到的整份消息
+    session.deriveMessages = function (...args) {
+      const out = origDeriveMessages.apply(session, args)
+      try {
+        if (!Array.isArray(out)) return out
+
+        // 计数以 surface 为准：不管这一层有没有真正动手（可能已被事件层摘过），
+        // 水位都要如实记下来。
+        const seqSet = strippableSeqsOf(session, st, cfg.keepLast)
+        let chars = 0
+        for (const seq of seqSet) {
+          let ev
+          try { ev = session.eventAt(seq) } catch { continue }
+          chars += reasoningSize(ev && ev.data && ev.data.message).chars
+        }
+        if (seqSet.size) {
+          report(session, st, stats, { stripped: seqSet.size, chars, keepLast: cfg.keepLast, dryRun: cfg.dryRun })
+        }
+        if (cfg.dryRun || seqSet.size === 0) return out
+
+        const drop = pickStrippable(out, cfg.keepLast)
+        if (!drop.size) return out
+        return out.map((m) => (drop.has(m) ? copyFor(m, st) : m))
+      } catch (e) {
+        appendLog('[gewu] 投影失败（返回原消息）：' + String((e && e.message) || e).slice(0, 160))
+        return out
       }
     }
-  }
 
-  if (!stripped && !failed) return null
-  return { stripped, failed, blocks, chars }
+    // 2) 压缩路径：compaction 逐条读消息时也走这里
+    session.deriveEventMessage = function (event) {
+      const out = origDeriveEvent.apply(session, arguments)
+      try {
+        if (!out || !event || String(event.type) !== 'assistant/message') return out
+        if (cfg.dryRun) return out
+        const set = strippableSeqsOf(session, st, cfg.keepLast)
+        if (!set.has(event.seq)) return out
+        let copy = st.seqCopies.get(out)
+        if (!copy) {
+          copy = stripMessage(out)
+          if (!copy) return out
+          st.seqCopies.set(out, copy)
+        }
+        return copy
+      } catch (e) {
+        appendLog('[gewu] 事件投影失败（返回原消息）：' + String((e && e.message) || e).slice(0, 160))
+        return out
+      }
+    }
+
+    st.patched = true
+    appendLog('[gewu] 已挂载 session=' + String(session.id || 'unknown') + ' keepLast=' + cfg.keepLast + (cfg.dryRun ? ' dryRun' : ''))
+    return true
+  } catch (e) {
+    appendLog('[gewu] 挂载异常：' + String((e && e.message) || e).slice(0, 200))
+    return false
+  }
 }
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = { ...DEFAULTS, ...(rawConfig || {}) }
   if (!cfg.enabled) {
-    console.log('[gewu] 已禁用（enabled=false）')
+    appendLog('[gewu] 已禁用（enabled=false）')
     return
   }
 
   const stats = loadStats()
+  appendLog('[gewu] 启动：keepLast=' + cfg.keepLast + (cfg.dryRun ? ' dryRun' : ''))
 
-  // 放在 next() 之前：让本步的请求构建读到已经摘干净的 surface
+  // pre-step 里挂载：此时 session 一定已存在，且早于本步的 buildRequest
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
       const agent = payload && payload.agent
-      const signal = payload && payload.signal
-      if (!signal || !signal.aborted) {
-        const r = sweep(agent, cfg)
-        if (r) {
-          const sid = sessionIdOf(agent)
-          const s = stats.sessions[sid] || (stats.sessions[sid] = { stripped: 0, blocks: 0, chars: 0, failed: 0, updatedAt: '' })
-          s.stripped += r.stripped
-          s.failed += r.failed
-          s.blocks += r.blocks
-          s.chars += r.chars
-          s.updatedAt = new Date().toISOString()
-          saveStats(stats)
-          console.log(
-            '[gewu] ' + (cfg.dryRun ? '可摘' : '已摘') + ' ' + r.stripped + ' 条 / ' + r.chars + ' 字 / ' +
-            r.blocks + ' 块（保留最近 ' + cfg.keepLast + ' 条；本会话累计 ' + s.stripped + ' 条 / ' + s.chars + ' 字）'
-          )
-        }
-      }
+      const session = agent && agent.session
+      if (session) patchSession(session, cfg, stats)
     } catch (e) {
-      console.warn('[gewu] 巡检失败（不影响对话）：', String((e && e.message) || e).slice(0, 160))
+      appendLog('[gewu] pre-step 挂载失败：' + String((e && e.message) || e).slice(0, 160))
     }
     return next()
   })
-
-  console.log(
-    '[gewu] 已启用：保留最近 ' + cfg.keepLast + ' 条思考，单步最多摘 ' + cfg.maxStripsPerStep + ' 条' +
-    (cfg.dryRun ? '（dryRun：只统计不替换）' : '')
-  )
 }
