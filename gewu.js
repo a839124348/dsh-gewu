@@ -333,14 +333,19 @@ export function apply(ctx, rawConfig = {}) {
   appendLog('[gewu] 启动：keepLast=' + cfg.keepLast + (cfg.dryRun ? ' dryRun' : ''))
 
   // pre-step 里挂载：此时 session 一定已存在，且早于本步的 buildRequest
-  ctx.on('agent/pre-step', async (payload, next) => {
-    try {
-      const agent = payload && payload.agent
-      const session = agent && agent.session
-      if (session) patchSession(session, cfg, stats)
-    } catch (e) {
-      appendLog('[gewu] pre-step 挂载失败：' + String((e && e.message) || e).slice(0, 160))
-    }
-    return next()
-  })
+  try {
+    ctx.on('agent/pre-step', async (payload, next) => {
+      try {
+        const agent = payload && payload.agent
+        const session = agent && agent.session
+        if (session) patchSession(session, cfg, stats)
+      } catch (e) {
+        appendLog('[gewu] pre-step 挂载失败：' + String((e && e.message) || e).slice(0, 160))
+      }
+      return next()
+    })
+  } catch (e) {
+    // 注册不上就安静退出，不把宿主带崩
+    appendLog('[gewu] 注册失败：' + String((e && e.message) || e).slice(0, 200))
+  }
 }
