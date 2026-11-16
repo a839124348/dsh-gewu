@@ -197,18 +197,26 @@ function providerOf(session) {
 }
 
 /**
+ * 记一次 provider 名（每个会话只记一次），并判断是否在跳过名单里。
+ * provider 从 request/header 读；首步可能还没有，等第二步就会出来。
+ */
+function noteProvider(session, st, cfg) {
+  const p = providerOf(session)
+  if (!p || p === st.lastProvider) return p
+  st.lastProvider = p
+  const list = Array.isArray(cfg.skipProviders) ? cfg.skipProviders : []
+  appendLog('[gewu] provider=' + p + (list.includes(p) ? '（在 skipProviders 里，跳过）' : ''))
+  return p
+}
+
+/**
  * 第三方中转可能靠“回放文本”恢复上游的思考签名：
  * 把旧的 reasoning 摘掉，它会查无此签名，重建出的历史和原始记录分叉，偶发故障。
  * 所以给一个 skipProviders 白名单，命中的 provider 一律不动。
  */
 function shouldSkip(session, st, cfg) {
   const list = Array.isArray(cfg.skipProviders) ? cfg.skipProviders : []
-  if (!list.length) return false
-  const p = providerOf(session)
-  if (p && st.lastProvider !== p) {
-    st.lastProvider = p
-    appendLog('[gewu] provider=' + p + (list.includes(p) ? '（在 skipProviders 里，跳过）' : ''))
-  }
+  const p = noteProvider(session, st, cfg)
   return !!p && list.includes(p)
 }
 
