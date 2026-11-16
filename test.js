@@ -147,11 +147,12 @@ ok('deriveMessages: 原文未被改', () => {
   assert.equal(s.eventAt(1).data.message.content.some((b) => b.type === 'reasoning'), true)
 })
 
-ok('keepLast=0 全摘', () => {
+ok('keepLast=0 被抬到 1：最近一条保留', () => {
   const s = makeSession(4)
   patchSession(s, cfg({ keepLast: 0 }), stats)
   const out = s.deriveMessages()
-  assert.equal(out.every((m) => !m.content.some((b) => b.type === 'reasoning')), true)
+  assert.equal(out.slice(0, 3).every((m) => !m.content.some((b) => b.type === 'reasoning')), true)
+  assert.equal(out[3].content.some((b) => b.type === 'reasoning'), true)
 })
 
 ok('dryRun: 不改视图，只记账', () => {
