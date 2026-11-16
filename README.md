@@ -40,6 +40,12 @@
         keepLast: 3
 ```
 
+| 配置 | 默认 | 说明 |
+|:--|:--|:--|
+| `keepLast` | `3` | 保留最近几条思考，接住当前这一轮 |
+| `dryRun` | `false` | 只统计，不改视图 |
+| `skipProviders` | `[]` | 不动的 provider（见下面「中转」） |
+
 ## 怎么检验
 
 1. `~/.dsh/gewu/gewu.log` 里出现 `[gewu] 已挂载 session=...`
@@ -61,6 +67,21 @@
 - 依赖 DSH 内部方法 `deriveMessages` / `deriveEventMessage`；哪天改名了，日志里会写 `[gewu] 挂载失败`，对话照常
 - 和核星记忆互不影响
 
+## 中转
+
+有些第三方网关没有字段承载上游的思考签名，只能靠「回放思考文本取哈希」来重建对话状态。
+把旧的思考摘掉，它会查无此签名，偶发对不上。
+
+遇到这类报错，把 provider 名加进 `skipProviders`（日志里会打出 `[gewu] provider=...`）：
+
+```yaml
+config:
+  skipProviders:
+    - 你的provider名
+```
+
+官方 API 不用管这一条。
+
 ---
 
-MIT · v0.2.0
+MIT · v0.2.1
