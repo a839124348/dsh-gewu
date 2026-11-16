@@ -1,6 +1,6 @@
 # INSTALL-FOR-AI.md — 给 DSH 模型的安装说明书
 
-> **适用版本：gewu v0.2.0。**
+> **适用版本：gewu v0.2.1。**
 > v0.1.0 的安装步骤一样，但旧版在 DSH 0.1.3+ 上无效 —— 如果发现装的是旧版，直接覆盖升级，不用重装。
 >
 > **读者：DSH 里的模型，不是用户。**
@@ -206,6 +206,7 @@ gewu 安装结果
 | DSH 起不来，YAML 报错 | 缩进或引号错 | 用备份还原，重做 2.3，注意 4/6 空格 |
 | `Cannot use import statement outside a module` | 插件目录缺 `package.json` 或没写 `"type":"module"` | 补上，再重启 |
 | 模型报 400 / invalid thinking / signature | 个别 provider 不接受无签名历史 | 把 `enabled: false` 加上，重启，如实汇报 |
+| 第三方中转偶发「签名/历史不一致」 | 有些网关靠回放思考文本恢复签名 | 在 `config` 里加 `skipProviders: [provider名]`（`gewu.log` 里有 `[gewu] provider=...`），重启 |
 | 长任务开始"忘了为什么这么做" | 摘得太狠 | `keepLast` 改 5，重启 |
 | QQ 或其他插件异常 | 极小概率事件，需定位 | 先 `enabled: false` 确认是否本插件导致，再汇报 |
 
