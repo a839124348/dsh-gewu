@@ -241,6 +241,9 @@ function report(session, st, stats, counts) {
  */
 export function patchSession(session, cfg, stats) {
   if (!session || typeof session !== 'object') return false
+  // keepLast 下限 1：当前工具循环那条 assistant 消息的 thinking 必须留着
+  const asked = Number(cfg.keepLast)
+  cfg = { ...cfg, keepLast: Math.max(1, Number.isFinite(asked) ? asked : DEFAULTS.keepLast) }
   const st = stateOf(session)
   if (st.patched) return true
 
@@ -319,6 +322,12 @@ export function apply(ctx, rawConfig = {}) {
     appendLog('[gewu] 已禁用（enabled=false）')
     return
   }
+
+  // keepLast 不能是 0：同一轮里带 tool_use 的那条 assistant 消息，thinking 必须原样回传。
+  // 摘到 0 会把当前工具循环的签名一起摘掉，官方 provider 可能直接 400。
+  const asked = Number(cfg.keepLast)
+  cfg.keepLast = Math.max(1, Number.isFinite(asked) ? asked : DEFAULTS.keepLast)
+  if (Number.isFinite(asked) && asked < 1) appendLog('[gewu] keepLast=' + asked + ' 不安全，已按 1 处理')
 
   const stats = loadStats()
   appendLog('[gewu] 启动：keepLast=' + cfg.keepLast + (cfg.dryRun ? ' dryRun' : ''))
