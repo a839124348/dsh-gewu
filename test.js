@@ -34,7 +34,7 @@ function msg(i, extra = {}) {
   }
 }
 
-function makeSession(n) {
+function makeSession(n, provider = 'test-provider') {
   const events = new Map()
   const nodes = []
   for (let i = 1; i <= n; i++) {
@@ -48,6 +48,7 @@ function makeSession(n) {
     eventAt(s) { return events.get(s) },
     deriveMessages() { return nodes.map((s) => events.get(s).data.message) },
     deriveEventMessage(ev) { return ev && ev.data ? ev.data.message : null },
+    requestHeader() { return { config: { provider, model: 'm' } } },
   }
 }
 
@@ -206,6 +207,21 @@ ok('统计文件写入', () => {
   const o = JSON.parse(fs.readFileSync(p, 'utf8'))
   assert.equal(o.version, 2)
   assert.equal(o.sessions['test-session'].stripped, 3)
+})
+
+ok('skipProviders: 命中的 provider 不摘', () => {
+  const s = makeSession(5, 'gateway-x')
+  patchSession(s, cfg({ keepLast: 1, skipProviders: ['gateway-x'] }), stats)
+  const out = s.deriveMessages()
+  assert.equal(out.every((m) => m.content.some((b) => b.type === 'reasoning')), true)
+  assert.equal(s.deriveEventMessage(s.eventAt(1)).content.some((b) => b.type === 'reasoning'), true)
+})
+
+ok('skipProviders: 没命中照常摘', () => {
+  const s = makeSession(5, 'official-x')
+  patchSession(s, cfg({ keepLast: 1, skipProviders: ['gateway-x'] }), stats)
+  const out = s.deriveMessages()
+  assert.equal(out[0].content.some((b) => b.type === 'reasoning'), false)
 })
 
 console.log('\n' + pass + '/' + (pass + fail) + ' PASS' + (fail ? '，' + fail + ' FAIL' : ''))
