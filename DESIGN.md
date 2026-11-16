@@ -13,83 +13,95 @@ DSH 把每一轮的推理（reasoning）存在 assistant 消息里，而历史�
 - 让"我查过了"这种没发生的事，变成下一轮的前提
 - 占掉 20%~45% 的上下文
 
-实测 6 个真实会话（只数长度，不读内容）：
+实测 6 个真实会话（只数长度，不读内容）：44.5% / 26.9% / 26.9% / 18.8% / 17.9% / 9.4%。
 
-| 会话事件数 | 推理字符 | 其它字符 | 推理占比 |
-|--:|--:|--:|--:|
-| 202 | 25,264 | 31,478 | **44.5%** |
-| 90 | 4,455 | 12,090 | 26.9% |
-| 79 | 2,509 | 6,826 | 26.9% |
-| 78 | 1,564 | 6,762 | 18.8% |
-| 72 | 2,014 | 9,217 | 17.9% |
-| 296 | 2,122 | 20,569 | 9.4% |
+## 二、为什么不能改写 assistant 消息
 
-中位数大概 20~27%。而且这是保守值：工具结果超过 4KB 会被 spill 到磁盘，
-真正进上下文的比例只会更高。
-
-## 二、它怎么做的
-
-每一步开始前（`agent/pre-step`），扫 `session.surface`，把**往轮** assistant 消息里的
-`reasoning` 块摘掉，用 `surfaceOp: replace` 在 surface 层换一条不含草稿的副本。
-
-原文仍在会话日志里 —— 可审计、可回放，只是模型看不到了。
-
-## 三、为什么改 surface 而不是拦请求
-
-`llm/stream` 看起来是入口，其实改不动：
-
-- 请求里的每条消息都被 `deepFreeze`
-- waterfall 的 `next()` 捕获了原对象，传新对象进去不生效（实测两次）
-
-而模型输入是从 `session.surface` 派生的（`buildRequest → session.deriveMessages`），
-所以正确的口子是：
+v0.1.0 走的是 `surfaceOp: replace`。在 DSH 0.1.3+ 上，这条路是死锁：
 
 ```js
-sess.append('assistant/message', { ...ev.data, message: 去掉草稿的副本 }, {
-  surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
-  sourceEventSeqs: [seq],
-})
+// dsh-session/lib/index.js · assertSourceEventReferences
+if (event.type === "assistant/message" && raw !== void 0)
+  throw new Error("assistant/message embeds its source stream and cannot carry sourceEventSeqs");
+
+const missing = shadowedSeqs.filter((seq) => !sources.has(seq));
+if (missing.length > 0)
+  throw new Error("surface replace: sourceEventSeqs must include every shadowed surface node");
 ```
 
-DSH 对 `assistant/message` 的替换没有额外限制（只有 `tool/result` 要求"只能改 content"、
-`system/message` 要求"只能换第一个节点"），所以这条路是开的。
+- 带 `sourceEventSeqs` → 第一条抛
+- 不带 → 第二条抛
 
-## 四、边界（写死，别改）
+**assistant 消息结构上不允许整条替换。** 这是设计决策，不是 bug：
+assistant 的 provenance 是它内嵌的 stream，不允许重新归属。
 
-- 只删 `type === 'reasoning'`；text / tool-call 一个字节不动
-- 保留最近 `keepLast` 条（默认 3），当前轮的工具循环要接得上
-- 单步最多摘 `maxStripsPerStep` 条（默认 12），历史积压分几步清完
-- 任何一条失败都跳过，不阻塞对话
-- 不碰 `tool/result`、不碰 user / developer / system 消息
-- 不删日志、不改存储
+`tool/result` 可以替换（只能改 content），`system/message` 可以替换（只能换 node 0），
+唯独 assistant 不行。所以插件不能再往"改记录"这个方向使劲。
 
-## 五、已知限制
+## 三、现在的做法：只改视图
+
+模型输入不是从日志直接来的，是从会话派生出来的。挂两个**只读投影**：
+
+```js
+session.deriveMessages()      // buildRequest 取模型输入的唯一入口
+session.deriveEventMessage()  // compaction 摘要逐条读消息的入口
+```
+
+两者都只返回「去掉 reasoning 的副本」：
+
+- 原文不动、surface 不动、日志不写
+- 副本按原对象缓存在 WeakMap 里，身份稳定（`buildRequest` 会 deepFreeze 并塞进 `frozenMessages` Set，
+  每次新建对象会让这个 Set 一直涨）
+- 副本上去掉 `source.replayState`：块数变了，旧签名必然失配，留着只会触发静默降级
+
+## 四、覆盖范围
+
+| 路径 | 经过哪一层 | 覆盖 |
+|:--|:--|:--|
+| 请求（buildRequest） | `deriveMessages` | ✅ |
+| 压缩摘要（compaction-basic） | `deriveEventMessage` | ✅ |
+| 图片卸载 / 工具结果裁剪 | `deriveEventMessage` | ✅ |
+| 子 agent / fork | 每个 session 各自挂载 | ✅ |
+| 重启后恢复的会话 | 首个 pre-step 时挂载 | ✅ |
+| 界面展示 / 消息反馈 | 用的是模块级 `deriveEventMessage` | ❌ 不影响（原本就不该动） |
+| token-meter 的上下文水位 | 模块级函数 | ⚠️ 可能偏高，真实计费以 provider 回执为准 |
+
+## 五、失败与自检
+
+- 挂载失败（方法不存在、实例不可扩展）→ 日志写 `[gewu] 挂载失败：...`，插件不生效，对话照常
+- 派生过程中任何异常 → 返回原结果，绝不影响对话
+- 桌面版主进程 console 不落盘，所以日志写在 `~/.dsh/gewu/gewu.log`
+- 重复挂载有幂等标记，不会叠加包装
+
+## 六、验证记录
+
+用隔离的 `DSH_HOME` + 本地假 provider 跑的真实链路（DSH 0.2.2-rc.1）：
+
+```
+控制组（keepLast=1）  #3 assistant[thinking(sig)+tool_use] | user[tool_result]
+实验组（keepLast=0）  #3 assistant[tool_use]              | user[tool_result]
+```
+
+两次都正常返回（`done`，exit 0），说明 provider 接受"没有思考的历史"。
+
+单测：27 项，覆盖只删 reasoning、保留 text/tool-call、副本身份稳定、dryRun、幂等、异常不炸。
+
+## 七、已知限制
 
 - **只处理跨轮接力，不管单轮内的解码卡死。**
-  一步之内模型如果已经在"写。做。写。做。"地打转，这个插件救不了 —— 它要等这一步结束。
-- **不保证 UI 不显示思考。** `stream` 字段保留，界面上可能还能展开看，但不再进模型输入。
-- **个别 provider 不接受无签名历史。** 替换后 `replayState` 会被去掉，遇到 400 就先
-  `enabled: false`。
-- **不区分模型。** 对所有 provider 一视同仁。
+  一步之内模型如果已经在"写。做。写。做。"地打转，这个插件救不了。
+- **依赖 DSH 内部方法名。** 升版改名时补丁挂不上，日志会报，功能退化但不影响对话。
+- **token-meter 的水位可能偏高**（它不走这层投影）。
+- **不区分模型**，对所有 provider 一视同仁。
 
-## 六、排查
-
-| 现象 | 可能原因 | 怎么办 |
-|:--|:--|:--|
-| 启动没有 `[gewu]` 那行 | 路径错 / profile 改错 / 没重启 | 核对 profile 是不是当前在用的那个 |
-| DSH 起不来，YAML 报错 | 缩进或引号错 | 用备份还原；`- id:` 前 4 空格，`name:`/`config:` 前 6 空格 |
-| 模型报 400 / invalid thinking / signature | 替换后签名被去掉，个别 provider 不接受 | 先 `enabled: false`，重启，反馈 |
-| 长任务开始"忘了为什么这么做" | 摘得太狠 | `keepLast` 调到 5~8 |
-| 日志文件变大 | 每条替换新增一个事件（原 `stream` 保留） | 正常，可接受 |
-
-## 七、回滚
+## 八、回滚
 
 把 `config.enabled` 改成 `false`，或删掉那段 `insert`，重启。
 
-日志和原文都没动过，回滚是干净的。
+插件没有写过任何会话内容，回滚是干净的。
 
-## 八、和核星记忆的关系
+## 九、和核星记忆的关系
 
 - 互不影响。可以同时装，先后顺序无所谓。
-- 它不注册工具、不写记忆、不读 `data/`，只动当前会话的 surface。
-- 核星监听 `agent/pre-step` 和 `llm/stream`，本插件只监听 `agent/pre-step`，不会重复记录 AI 回复。
+- 不注册工具、不写记忆、不读 `data/`。
+- 核星扫常识层用的是 `surface.deriveEventMessage`（surface 对象上的方法），不走这层补丁。
