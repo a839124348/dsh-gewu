@@ -66,14 +66,34 @@ session.deriveEventMessage()  // compaction 摘要逐条读消息的入口
 | 界面展示 / 消息反馈 | 用的是模块级 `deriveEventMessage` | ❌ 不影响（原本就不该动） |
 | token-meter 的上下文水位 | 模块级函数 | ⚠️ 可能偏高，真实计费以 provider 回执为准 |
 
-## 五、失败与自检
+## 五、第三方中转的坑
+
+有些网关没有字段承载上游的思考签名，只能靠「把回放的思考文本取哈希」来重建对话状态。
+如果把旧的 reasoning 摘掉，网关重建时会「查无此签名」，重建出的历史和原始记录分叉 ——
+表现是偶发故障，很难查。
+
+所以 v0.2.1 加了 `skipProviders`：
+
+```yaml
+config:
+  skipProviders:
+    - 你的provider名
+```
+
+命中的 provider 一律不动，日志里会写明「在 skipProviders 里，跳过」。
+provider 名从 `request/header` 里读，挂载后的第一次请求就能在 `gewu.log` 里看到。
+
+默认是空列表（所有 provider 都摘）。用官方 API 的不用管；用第三方中转、又遇到偶发
+「签名/历史不一致」报错的，把这个 provider 加进去。
+
+## 六、失败与自检
 
 - 挂载失败（方法不存在、实例不可扩展）→ 日志写 `[gewu] 挂载失败：...`，插件不生效，对话照常
 - 派生过程中任何异常 → 返回原结果，绝不影响对话
 - 桌面版主进程 console 不落盘，所以日志写在 `~/.dsh/gewu/gewu.log`
 - 重复挂载有幂等标记，不会叠加包装
 
-## 六、验证记录
+## 七、验证记录
 
 用隔离的 `DSH_HOME` + 本地假 provider 跑的真实链路（DSH 0.2.2-rc.1）：
 
@@ -86,7 +106,7 @@ session.deriveEventMessage()  // compaction 摘要逐条读消息的入口
 
 单测：27 项，覆盖只删 reasoning、保留 text/tool-call、副本身份稳定、dryRun、幂等、异常不炸。
 
-## 七、已知限制
+## 八、已知限制
 
 - **只处理跨轮接力，不管单轮内的解码卡死。**
   一步之内模型如果已经在"写。做。写。做。"地打转，这个插件救不了。
@@ -94,13 +114,13 @@ session.deriveEventMessage()  // compaction 摘要逐条读消息的入口
 - **token-meter 的水位可能偏高**（它不走这层投影）。
 - **不区分模型**，对所有 provider 一视同仁。
 
-## 八、回滚
+## 九、回滚
 
 把 `config.enabled` 改成 `false`，或删掉那段 `insert`，重启。
 
 插件没有写过任何会话内容，回滚是干净的。
 
-## 九、和核星记忆的关系
+## 十、和核星记忆的关系
 
 - 互不影响。可以同时装，先后顺序无所谓。
 - 不注册工具、不写记忆、不读 `data/`。
