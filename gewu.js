@@ -40,6 +40,8 @@ const DEFAULTS = {
   keepLast: 3,
   // 只统计、不改视图
   dryRun: false,
+  // 跳过这些 provider（第三方中转可能靠回放文本恢复思考签名，摘了会偶发故障）
+  skipProviders: [],
 }
 
 const STATE_DIR = process.env.GEWU_DIR || path.join(os.homedir(), '.dsh', 'gewu')
@@ -158,6 +160,7 @@ function stateOf(session) {
       seqKey: '',
       lastLogAt: 0,
       lastReport: null,
+      lastProvider: '',
     }
     STATES.set(session, st)
   }
@@ -181,6 +184,32 @@ function copyFor(message, st) {
     st.copies.set(message, copy)
   }
   return copy
+}
+
+/** 当前会话用的 provider 名（request/header 里有；首步可能还没有） */
+function providerOf(session) {
+  try {
+    const h = session.requestHeader()
+    return String((h && h.config && h.config.provider) || '')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 第三方中转可能靠“回放文本”恢复上游的思考签名：
+ * 把旧的 reasoning 摘掉，它会查无此签名，重建出的历史和原始记录分叉，偶发故障。
+ * 所以给一个 skipProviders 白名单，命中的 provider 一律不动。
+ */
+function shouldSkip(session, st, cfg) {
+  const list = Array.isArray(cfg.skipProviders) ? cfg.skipProviders : []
+  if (!list.length) return false
+  const p = providerOf(session)
+  if (p && st.lastProvider !== p) {
+    st.lastProvider = p
+    appendLog('[gewu] provider=' + p + (list.includes(p) ? '（在 skipProviders 里，跳过）' : ''))
+  }
+  return !!p && list.includes(p)
 }
 
 function report(session, st, stats, counts) {
@@ -220,6 +249,7 @@ export function patchSession(session, cfg, stats) {
       const out = origDeriveMessages.apply(session, args)
       try {
         if (!Array.isArray(out)) return out
+        if (shouldSkip(session, st, cfg)) return out
 
         // 计数以 surface 为准：不管这一层有没有真正动手（可能已被事件层摘过），
         // 水位都要如实记下来。
@@ -250,6 +280,7 @@ export function patchSession(session, cfg, stats) {
       try {
         if (!out || !event || String(event.type) !== 'assistant/message') return out
         if (cfg.dryRun) return out
+        if (shouldSkip(session, st, cfg)) return out
         const set = strippableSeqsOf(session, st, cfg.keepLast)
         if (!set.has(event.seq)) return out
         let copy = st.seqCopies.get(out)
