@@ -1,6 +1,6 @@
 {
   "name": "dsh-gewu",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "让模型只看结果，不反复读自己的旧草稿",
   "type": "module",
   "license": "MIT",
